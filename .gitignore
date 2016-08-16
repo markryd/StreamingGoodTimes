@@ -1,0 +1,7 @@
+src/StreamingGoodTimes/obj**
+src/StreamingGoodTimes/bin/**
+**/.suo
+src/StreamingGoodTimes/bin/**
+**.xproj.user
+**/project.lock.json
+.vs/**
