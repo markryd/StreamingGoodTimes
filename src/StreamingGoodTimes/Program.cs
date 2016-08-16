@@ -40,14 +40,15 @@ namespace StreamingGoodTimes
                 {
                     for (var j = 0; j < NumWrites; j++)
                         using (var zip = new DeflateStream(stream, CompressionMode.Compress, true))
-                        using (var buffer = new BufferedStream(zip))
+                        using (var buffer = new BufferedStream2(zip, 8192, true))
                         using(var bson = new BsonWriter(buffer) { CloseOutput = false})
                         {
+                            LogServer($"ready to write message {j}");
                             Signal.WaitOne();
-                            Console.WriteLine($"writing message {j}");
+                            LogServer($"writing message {j}");
                             serializer.Serialize(bson, Envelope.Create(MessageLength));
                             bson.Flush();
-                            Console.WriteLine($"message written {j}");
+                            LogServer($"message written {j}");
                         }
                 }
             }
@@ -68,12 +69,12 @@ namespace StreamingGoodTimes
                 {
                     for (var j = 0; j < NumWrites; j++)
                     using (var zip = new DeflateStream(stream, CompressionMode.Decompress, true))
-                    using (var buffer = new BufferedStream(zip))
+                    using (var buffer = new BufferedStream2(zip, 4096, true))
                     using (var bson = new BsonReader(buffer) { CloseInput = false })
                     {
-                        Console.WriteLine($"reading message {j}");
+                        LogClient($"reading message {j}");
                         var message = serializer.Deserialize<Envelope>(bson).Message;
-                        Console.WriteLine($"message read {j}");
+                        LogClient($"message read {j}");
                         Signal.Set();
                     }
                 }
@@ -82,7 +83,19 @@ namespace StreamingGoodTimes
 
 #region totes-region-bro
         static readonly AutoResetEvent Signal = new AutoResetEvent(true);
-        
+
+        static void LogClient(string message)
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine(message);
+        }
+
+        static void LogServer(string message)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine(message);
+        }
+
         public class Envelope
         {
             public string Message { get; set; }

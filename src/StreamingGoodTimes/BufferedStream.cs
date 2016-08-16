@@ -4,7 +4,6 @@
 
 using System;
 using System.Diagnostics;
-using System.Diagnostics.Contracts;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -45,8 +44,21 @@ namespace StreamingGoodTimes
     /// bytes cached (not yet written to the target stream or not yet consumed by the user) is never larger than the 
     /// actual specified buffer size.
     /// </summary>
-    public sealed class BufferedStream : Stream
+    internal sealed class BufferedStream2 : Stream
     {
+        static class SR
+        {
+            public static string ArgumentOutOfRange_MustBePositive => "'{0}' must be greater than zero.";
+            public static string ObjectDisposed_StreamClosed => "Cannot access a closed Stream.";
+            public static string NotSupported_UnseekableStream => "Stream does not support seeking.";
+            public static string NotSupported_UnreadableStream => "Stream does not support reading.";
+            public static string NotSupported_UnwritableStream => "Stream does not support writing.";
+            public static string ArgumentOutOfRange_NeedNonNegNum => "Non-negative number required.";
+            public static string NotSupported_CannotWriteToBufferedStreamIfReadBufferCannotBeFlushed => "Cannot write to a BufferedStream while the read buffer is not empty if the underlying stream is not seekable. Ensure that the stream underlying this BufferedStream can seek or avoid interleaving read and write operations on this BufferedStream.";
+            public static string ArgumentNull_Buffer => "Buffer cannot be null.";
+            public static string Argument_InvalidOffLen => "Offset and length were out of bounds for the array or count is greater than the number of elements from index to the end of the source collection.";
+        }
+
         /// <summary><code>MaxShadowBufferSize</code> is chosen such that shadow buffers are not allocated on the Large Object Heap.
         /// Currently, an object is allocated on the LOH if it is larger than 85000 bytes. See LARGE_OBJECT_SIZE in src/gc/gc.h
         /// We will go with exactly 80 Kbytes, although this is somewhat arbitrary.</summary>
@@ -64,6 +76,7 @@ namespace StreamingGoodTimes
                                                             // Removing a private default constructor is a breaking change for the DataDebugSerializer.
                                                             // Because this ctor was here previously we need to keep it around.
         private SemaphoreSlim _asyncActiveSemaphore;
+        private bool _leaveOpen;
 
         internal SemaphoreSlim LazyEnsureAsyncActiveSemaphoreInitialized()
         {
@@ -72,33 +85,39 @@ namespace StreamingGoodTimes
             return LazyInitializer.EnsureInitialized(ref _asyncActiveSemaphore, () => new SemaphoreSlim(1, 1));
         }
 
-        public BufferedStream(Stream stream)
+        public BufferedStream2(Stream stream)
             : this(stream, DefaultBufferSize)
         {
         }
 
-        public BufferedStream(Stream stream, int bufferSize)
+        public BufferedStream2(Stream stream, bool leaveOpen)
+        : this(stream, DefaultBufferSize, leaveOpen)
+        {
+        }
+
+        public BufferedStream2(Stream stream, int bufferSize, bool leaveOpen = false)
         {
             if (stream == null)
                 throw new ArgumentNullException(nameof(stream));
 
             if (bufferSize <= 0)
-                throw new ArgumentOutOfRangeException(nameof(bufferSize), "oh no");
+                throw new ArgumentOutOfRangeException(nameof(bufferSize), string.Format(SR.ArgumentOutOfRange_MustBePositive, nameof(bufferSize)));
 
             _stream = stream;
             _bufferSize = bufferSize;
+            _leaveOpen = leaveOpen;
 
             // Allocate _buffer on its first use - it will not be used if all reads
             // & writes are greater than or equal to buffer size.
 
             if (!_stream.CanRead && !_stream.CanWrite)
-                throw new ObjectDisposedException(null, "doh");
+                throw new ObjectDisposedException(null, SR.ObjectDisposed_StreamClosed);
         }
 
         private void EnsureNotClosed()
         {
             if (_stream == null)
-                throw new ObjectDisposedException(null, "stream closed");
+                throw new ObjectDisposedException(null, SR.ObjectDisposed_StreamClosed);
         }
 
         private void EnsureCanSeek()
@@ -106,7 +125,7 @@ namespace StreamingGoodTimes
             Debug.Assert(_stream != null);
 
             if (!_stream.CanSeek)
-                throw new NotSupportedException("unseekable stream");
+                throw new NotSupportedException(SR.NotSupported_UnseekableStream);
         }
 
         private void EnsureCanRead()
@@ -114,7 +133,7 @@ namespace StreamingGoodTimes
             Debug.Assert(_stream != null);
 
             if (!_stream.CanRead)
-                throw new NotSupportedException("unreadable stream");
+                throw new NotSupportedException(SR.NotSupported_UnreadableStream);
         }
 
         private void EnsureCanWrite()
@@ -122,7 +141,7 @@ namespace StreamingGoodTimes
             Debug.Assert(_stream != null);
 
             if (!_stream.CanWrite)
-                throw new NotSupportedException("unwriteable stream");
+                throw new NotSupportedException(SR.NotSupported_UnwritableStream);
         }
 
         private void EnsureShadowBufferAllocated()
@@ -151,7 +170,6 @@ namespace StreamingGoodTimes
 
         public override bool CanRead
         {
-            [Pure]
             get
             {
                 return _stream != null && _stream.CanRead;
@@ -160,7 +178,6 @@ namespace StreamingGoodTimes
 
         public override bool CanWrite
         {
-            [Pure]
             get
             {
                 return _stream != null && _stream.CanWrite;
@@ -169,7 +186,6 @@ namespace StreamingGoodTimes
 
         public override bool CanSeek
         {
-            [Pure]
             get
             {
                 return _stream != null && _stream.CanSeek;
@@ -202,7 +218,7 @@ namespace StreamingGoodTimes
             set
             {
                 if (value < 0)
-                    throw new ArgumentOutOfRangeException(nameof(value), "need no neg num");
+                    throw new ArgumentOutOfRangeException(nameof(value), SR.ArgumentOutOfRange_NeedNonNegNum);
 
                 EnsureNotClosed();
                 EnsureCanSeek();
@@ -228,7 +244,10 @@ namespace StreamingGoodTimes
                     }
                     finally
                     {
-                        _stream.Dispose();
+                        if (!_leaveOpen)
+                        {
+                            _stream.Dispose();
+                        }
                     }
                 }
             }
@@ -285,7 +304,7 @@ namespace StreamingGoodTimes
         public override Task FlushAsync(CancellationToken cancellationToken)
         {
             if (cancellationToken.IsCancellationRequested)
-                return Task.FromCanceled<int>(cancellationToken);
+                return TaskFromCanceled<int>(cancellationToken);
 
             EnsureNotClosed();
 
@@ -376,7 +395,7 @@ namespace StreamingGoodTimes
             // However, since the user did not call a method that is intuitively expected to seek, a better message is in order.
             // Ideally, we would throw an InvalidOperation here, but for backward compat we have to stick with NotSupported.
             if (!_stream.CanSeek)
-                throw new NotSupportedException("blah");
+                throw new NotSupportedException(SR.NotSupported_CannotWriteToBufferedStreamIfReadBufferCannotBeFlushed);
 
             FlushRead();
         }
@@ -441,13 +460,13 @@ namespace StreamingGoodTimes
         public override int Read([In, Out] byte[] array, int offset, int count)
         {
             if (array == null)
-                throw new ArgumentNullException(nameof(array), "null buffer");
+                throw new ArgumentNullException(nameof(array), SR.ArgumentNull_Buffer);
             if (offset < 0)
-                throw new ArgumentOutOfRangeException(nameof(offset), "R.ArgumentOutOfRange_NeedNonNegNum");
+                throw new ArgumentOutOfRangeException(nameof(offset), SR.ArgumentOutOfRange_NeedNonNegNum);
             if (count < 0)
-                throw new ArgumentOutOfRangeException(nameof(count), "SR.ArgumentOutOfRange_NeedNonNegNum");
+                throw new ArgumentOutOfRangeException(nameof(count), SR.ArgumentOutOfRange_NeedNonNegNum);
             if (array.Length - offset < count)
-                throw new ArgumentException("SR.Argument_InvalidOffLen");
+                throw new ArgumentException(SR.Argument_InvalidOffLen);
 
             EnsureNotClosed();
             EnsureCanRead();
@@ -520,17 +539,17 @@ namespace StreamingGoodTimes
         {
 
             if (buffer == null)
-                throw new ArgumentNullException(nameof(buffer), "SR.ArgumentNull_Buffer");
+                throw new ArgumentNullException(nameof(buffer), SR.ArgumentNull_Buffer);
             if (offset < 0)
-                throw new ArgumentOutOfRangeException(nameof(offset), "SR.ArgumentOutOfRange_NeedNonNegNum");
+                throw new ArgumentOutOfRangeException(nameof(offset), SR.ArgumentOutOfRange_NeedNonNegNum);
             if (count < 0)
-                throw new ArgumentOutOfRangeException(nameof(count), "SR.ArgumentOutOfRange_NeedNonNegNum");
+                throw new ArgumentOutOfRangeException(nameof(count), SR.ArgumentOutOfRange_NeedNonNegNum);
             if (buffer.Length - offset < count)
-                throw new ArgumentException("SR.Argument_InvalidOffLen");
+                throw new ArgumentException(SR.Argument_InvalidOffLen);
 
             // Fast path check for cancellation already requested
             if (cancellationToken.IsCancellationRequested)
-                return Task.FromCanceled<int>(cancellationToken);
+                return TaskFromCanceled<int>(cancellationToken);
 
             EnsureNotClosed();
             EnsureCanRead();
@@ -564,7 +583,7 @@ namespace StreamingGoodTimes
 
                         return (error == null)
                                     ? LastSyncCompletedReadTask(bytesFromBuffer)
-                                    : Task.FromException<int>(error);
+                                    : TaskFromException<int>(error);
                     }
                 }
                 finally
@@ -709,13 +728,13 @@ namespace StreamingGoodTimes
         public override void Write(byte[] array, int offset, int count)
         {
             if (array == null)
-                throw new ArgumentNullException(nameof(array), "SR.ArgumentNull_Buffer");
+                throw new ArgumentNullException(nameof(array), SR.ArgumentNull_Buffer);
             if (offset < 0)
-                throw new ArgumentOutOfRangeException(nameof(offset), "SR.ArgumentOutOfRange_NeedNonNegNum");
+                throw new ArgumentOutOfRangeException(nameof(offset), SR.ArgumentOutOfRange_NeedNonNegNum);
             if (count < 0)
-                throw new ArgumentOutOfRangeException(nameof(count), "SR.ArgumentOutOfRange_NeedNonNegNum");
+                throw new ArgumentOutOfRangeException(nameof(count), SR.ArgumentOutOfRange_NeedNonNegNum);
             if (array.Length - offset < count)
-                throw new ArgumentException("SR.Argument_InvalidOffLen");
+                throw new ArgumentException(SR.Argument_InvalidOffLen);
 
             EnsureNotClosed();
             EnsureCanWrite();
@@ -847,17 +866,17 @@ namespace StreamingGoodTimes
         {
 
             if (buffer == null)
-                throw new ArgumentNullException(nameof(buffer), "SR.ArgumentNull_Buffer");
+                throw new ArgumentNullException(nameof(buffer), SR.ArgumentNull_Buffer);
             if (offset < 0)
-                throw new ArgumentOutOfRangeException(nameof(offset), "SR.ArgumentOutOfRange_NeedNonNegNum");
+                throw new ArgumentOutOfRangeException(nameof(offset), SR.ArgumentOutOfRange_NeedNonNegNum);
             if (count < 0)
-                throw new ArgumentOutOfRangeException(nameof(count), "SR.ArgumentOutOfRange_NeedNonNegNum");
+                throw new ArgumentOutOfRangeException(nameof(count), SR.ArgumentOutOfRange_NeedNonNegNum);
             if (buffer.Length - offset < count)
-                throw new ArgumentException("SR.Argument_InvalidOffLen");
+                throw new ArgumentException(SR.Argument_InvalidOffLen);
 
             // Fast path check for cancellation already requested
             if (cancellationToken.IsCancellationRequested)
-                return Task.FromCanceled<int>(cancellationToken);
+                return TaskFromCanceled<int>(cancellationToken);
 
             EnsureNotClosed();
             EnsureCanWrite();
@@ -889,8 +908,8 @@ namespace StreamingGoodTimes
                         Debug.Assert(count == 0);
 
                         return (error == null)
-                                    ? Task.CompletedTask
-                                    : Task.FromException(error);
+                                    ? Task.FromResult(false)
+                                    : TaskFromException(error);
                     }
                 }
                 finally
@@ -1073,7 +1092,7 @@ namespace StreamingGoodTimes
         public override void SetLength(long value)
         {
             if (value < 0)
-                throw new ArgumentOutOfRangeException(nameof(value), "SR.ArgumentOutOfRange_NeedNonNegNum");
+                throw new ArgumentOutOfRangeException(nameof(value), SR.ArgumentOutOfRange_NeedNonNegNum);
 
             EnsureNotClosed();
             EnsureCanSeek();
@@ -1081,6 +1100,28 @@ namespace StreamingGoodTimes
 
             Flush();
             _stream.SetLength(value);
+        }
+
+        Task<T> TaskFromException<T>(Exception e)
+        {
+            var tcs = new TaskCompletionSource<T>();
+            tcs.SetException(e);
+            return tcs.Task;
+        }
+
+        Task TaskFromException(Exception e)
+        {
+            return TaskFromException<bool>(e);
+        }
+
+        Task TaskFromCanceled(CancellationToken cancellationToken)
+        {
+            return TaskFromCanceled<bool>(cancellationToken);
+        }
+
+        Task<T> TaskFromCanceled<T>(CancellationToken cancellationToken)
+        {
+            return new Task<T>(x => default(T), cancellationToken);
         }
     }  // class BufferedStream
 }  // namespace
